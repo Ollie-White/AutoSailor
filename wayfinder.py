@@ -1,12 +1,14 @@
-from flask import Flask, jsonify, request
-from shapely.geometry import Point, Polygon, LineString
 import heapq
-import time
-import matplotlib.pyplot as plt
-from scipy.spatial import distance
 import math
 import json
-
+import time
+import matplotlib.pyplot as plt
+from vehicle_connection import VehicleConnection
+from flask import Flask, jsonify, request
+from flask_socketio import SocketIO
+from flask_cors import CORS
+from shapely.geometry import Point, Polygon, LineString
+from scipy.spatial import distance
 
 
 #Load configuration from external file
@@ -24,84 +26,16 @@ geofence_polygon = Polygon(geofence)
 # Define the buffer distance (in degrees)
 BUFFER_DISTANCE = config['buffer_distance']
 
-if USE_SIMULATOR:
-    from pymavlink import mavutil
-
 if RUN_API:
     app = Flask(__name__)
+    socketio = SocketIO(app, cors_allowed_origins="*")
+    CORS(app, origins="*")
 
 def create_inner_buffer(geofence_polygon, buffer_distance):
     return geofence_polygon.buffer(-buffer_distance)
 
 # Create the inner buffer polygon
 inner_buffer = create_inner_buffer(geofence_polygon, BUFFER_DISTANCE)
-
-class VehicleConnection:
-    def __init__(self):
-        if USE_SIMULATOR:
-            self.connection = mavutil.mavlink_connection('udp:127.0.0.1:14550')
-            print("Waiting for heartbeat...")
-            self.connection.wait_heartbeat()
-            print(f"Connected to system {self.connection.target_system}, component {self.connection.target_component}")
-        else:
-            self.connection = None
-
-    def get_current_position(self):
-        if USE_SIMULATOR:
-            msg = self.connection.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
-            lat = msg.lat / 1e7
-            lon = msg.lon / 1e7
-        else:
-            # Replace with your desired offline coordinates
-            lat, lon = SIMULATOR_START
-        return lat, lon
-
-    def send_waypoints(self, waypoints):
-        if USE_SIMULATOR:
-            print("Sending waypoints...")
-            self.connection.mav.mission_count_send(self.connection.target_system, self.connection.target_component, len(waypoints))
-
-            for i, (lat, lon) in enumerate(waypoints):
-                time.sleep(1)  # Prevent packet loss
-                self.connection.mav.mission_item_send(
-                    self.connection.target_system, self.connection.target_component, i,
-                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 0, 0, 0, 0, 0,
-                    lat, lon, 0
-                )
-                print(f"Sent waypoint {i}: ({lat}, {lon}, 0)")
-        else:
-            print("Offline mode: Waypoints would be sent here in simulator mode.")
-            for i, (lat, lon) in enumerate(waypoints):
-                print(f"Waypoint {i}: ({lat}, {lon}, 0)")
-
-    def set_mode(self, mode):
-        if USE_SIMULATOR:
-            mode_id = self.connection.mode_mapping()[mode]
-            self.connection.mav.set_mode_send(
-                self.connection.target_system,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                mode_id
-            )
-        print(f"Mode set to {mode}")
-
-    def arm_vehicle(self):
-        if USE_SIMULATOR:
-            print("Arming vehicle...")
-            self.connection.arducopter_arm()
-            time.sleep(1)
-        print("Vehicle armed!")
-
-    def verify_mission(self):
-        if USE_SIMULATOR:
-            print("Verifying mission upload...")
-            msg = self.connection.recv_match(type='MISSION_ACK', blocking=True)
-            if msg.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
-                print("Mission uploaded successfully!")
-            else:
-                print(f"Mission upload failed: {msg}")
-        else:
-            print("Offline mode: Mission verification would occur here in simulator mode.")
 
 def is_straight_line_possible(start, end):
     line = LineString([start, end])
@@ -207,7 +141,7 @@ def plot_geofence_and_path(geofence, inner_buffer, start, end, path):
     geofence_lats, geofence_lons = zip(*geofence)
 
     # Plot geofence
-    plt.plot(geofence_lons, geofence_lats, 'b-', label='Geofence')
+    #plt.plot(geofence_lons, geofence_lats, 'b-', label='Geofence')
 
     # Plot inner buffer
     inner_buffer_coords = list(inner_buffer.exterior.coords)
@@ -238,57 +172,63 @@ def plot_visibility_graph(geofence, inner_buffer, start, end, graph):
     plt.show()
 
 def navigate(destination):
-    if destination is None:
-        destination = (SIMULATOR_END[0],SIMULATOR_END[1])
-    current_position = vehicle.get_current_position()
-    if inner_buffer.contains(Point(destination)):
-        plot_geofence_and_inner_buffer(geofence, inner_buffer, current_position, destination)
-        waypoints = create_waypoint_mission(current_position, destination)
-        if waypoints:
-            print("Waypoints:", waypoints)
-            vehicle.send_waypoints(waypoints)
-            vehicle.verify_mission()
-            vehicle.arm_vehicle()
-            vehicle.set_mode("AUTO")
-            # Plot the geofence, inner buffer, and path
-            plot_geofence_and_path(geofence, inner_buffer, current_position, destination, waypoints)
-        else:
-            print("No valid path found within the inner buffer.")
-        
-    else:
-        print("Destination is outside the safe inner buffer.")
-
-@app.route('/checkConnection', methods=['GET'])
-def check_connection():
-    if vehicle:
-        return jsonify({"vehicle": "connected"}), 200
-    else:
-        return jsonify({"error": "Vehicle connection not established."}), 500
-
-@app.route('/getPosition', methods=['GET'])
-def getPosition():
-    if vehicle:
-        try:
-            current_position = vehicle.get_current_position()
-            return jsonify({"current_position": current_position})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    else:
-        return jsonify({"error": "Vehicle connection not established."}), 500
-
-@app.route('/navigateBoatToPoint', methods=['GET'])
-def navigateBoatToPoint():
-    destination = request.body.get('destination')
     try:
-        navigate(destination)
-        return jsonify({"message": "Navigation to point initiated."}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        if destination is None:
+            destination = (SIMULATOR_END[0], SIMULATOR_END[1])
 
+        current_position = vehicle.get_current_position()
+
+        if not inner_buffer.contains(Point(destination)):
+            return {"error": "Destination is outside the safe inner buffer."}, 400
+        #plot_geofence_and_inner_buffer(geofence, inner_buffer, current_position, destination)
+        waypoints = create_waypoint_mission(current_position, destination)
+
+        if not waypoints:
+            return {"error": "No valid path found within the inner buffer."}, 400
+
+        print("Waypoints:", waypoints)
+        vehicle.send_waypoints(waypoints)
+        #vehicle.verify_mission()
+        vehicle.arm_vehicle()
+        vehicle.set_mode("LOITER")
+        time.sleep(1)
+        vehicle.set_mode("AUTO")
+
+        # Plot the geofence, inner buffer, and path
+        #plot_geofence_and_path(geofence, inner_buffer, current_position, destination, waypoints)
+
+        return {"message": "Navigation initiated successfully.", "waypoints": waypoints}, 200
+
+    except Exception as e:
+        return {"error": f"An error occurred during navigation: {str(e)}"}, 500
+
+# Update the navigateBoatToPoint route to use the new navigate function
+@app.route('/navigateBoatToPoint', methods=['POST'])
+def navigateBoatToPoint():
+    data = request.json
+    destination = data.get('destination')
+
+    if not destination or 'lat' not in destination or 'lng' not in destination:
+        return jsonify({"error": "Invalid destination format."}), 400
+
+    result, status_code = navigate((destination['lat'], destination['lng']))
+    return jsonify(result), status_code
+
+@socketio.on('connect')
+def on_connect():
+    print("Client connected")
+
+def emit_position():
+    while True:
+        lat, lon = vehicle.get_current_position()
+        socketio.emit('position_update', {'lon': lon, 'lat': lat})
+        socketio.sleep(0.5)
 
 if __name__ == "__main__":
     vehicle = VehicleConnection()
     if RUN_API:
-        app.run(debug=True)
+        #app.run(debug=True)
+        socketio.start_background_task(emit_position)
+        socketio.run(app, host='0.0.0.0', port=5000)
     else:
         navigate(None)
